@@ -113,6 +113,7 @@ public class Gt06ProtocolDecoder extends BaseProtocolDecoder {
     public static final int MSG_BMS = 0x40;                // WD-209
     public static final int MSG_MULTIMEDIA = 0x41;         // WD-209
     public static final int MSG_ALARM = 0x95;              // JC100
+    public static final int MSG_PERIPHERAL = 0xF2;         // VL842
 
     private enum Variant {
         VXT01,
@@ -234,21 +235,6 @@ public class Gt06ProtocolDecoder extends BaseProtocolDecoder {
         }
     }
 
-    private static boolean hasLanguage(int type) {
-        switch (type) {
-            case MSG_GPS_PHONE:
-            case MSG_HEARTBEAT:
-            case MSG_GPS_LBS_STATUS_3:
-            case MSG_LBS_MULTIPLE_1:
-            case MSG_LBS_MULTIPLE_2:
-            case MSG_LBS_2:
-            case MSG_FENCE_MULTI:
-                return true;
-            default:
-                return false;
-        }
-    }
-
     private void sendResponse(Channel channel, boolean extended, int type, int index, ByteBuf content) {
         if (channel != null) {
             ByteBuf response = Unpooled.buffer();
@@ -284,12 +270,12 @@ public class Gt06ProtocolDecoder extends BaseProtocolDecoder {
     }
 
     public static boolean decodeGps(Position position, ByteBuf buf, boolean hasLength, TimeZone timezone) {
-        return decodeGps(position, buf, hasLength, true, true, false, timezone);
+        return decodeGps(position, buf, hasLength, true, true, false, false, timezone);
     }
 
     public static boolean decodeGps(
             Position position, ByteBuf buf, boolean hasLength, boolean hasSatellites,
-            boolean hasSpeed, boolean longSpeed, TimeZone timezone) {
+            boolean hasSpeed, boolean longSpeed, boolean swapFlags, TimeZone timezone) {
 
         DateBuilder dateBuilder = new DateBuilder(timezone)
                 .setDate(buf.readUnsignedByte(), buf.readUnsignedByte(), buf.readUnsignedByte())
@@ -307,12 +293,18 @@ public class Gt06ProtocolDecoder extends BaseProtocolDecoder {
         double latitude = buf.readUnsignedInt() / 60.0 / 30000.0;
         double longitude = buf.readUnsignedInt() / 60.0 / 30000.0;
 
+        int flags = 0;
+        if (swapFlags) {
+            flags = buf.readUnsignedShort();
+        }
         if (hasSpeed) {
             position.setSpeed(UnitsConverter.knotsFromKph(
                     longSpeed ? buf.readUnsignedShort() : buf.readUnsignedByte()));
         }
+        if (!swapFlags) {
+            flags = buf.readUnsignedShort();
+        }
 
-        int flags = buf.readUnsignedShort();
         position.setCourse(BitUtil.to(flags, 10));
         position.setValid(BitUtil.check(flags, 12));
 
@@ -830,25 +822,36 @@ public class Gt06ProtocolDecoder extends BaseProtocolDecoder {
                     position.addAlarm(decodeAlarm(buf.readUnsignedByte(), modelLW));
                     buf.readUnsignedByte(); // language
                     position.set(Position.KEY_BATTERY_LEVEL, buf.readUnsignedByte());
-                    buf.readUnsignedByte(); // working mode
+                    int mode = buf.readUnsignedByte();
                     position.set(Position.KEY_POWER, buf.readUnsignedShort() / 100.0);
+                    buf.readUnsignedByte(); // reserved
+                    buf.readUnsignedShort(); // working time
+                    if (mode == 4) {
+                        position.set(Position.PREFIX_TEMP + 1, buf.readShort() / 10.0);
+                    }
                 } else {
                     if (type == MSG_GPS_LBS_STATUS_5) {
                         position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.01);
                     }
-                    int battery = buf.readUnsignedByte();
-                    if (battery <= 6) {
-                        position.set(Position.KEY_BATTERY_LEVEL, battery * 100 / 6);
-                    } else if (battery <= 100) {
-                        position.set(Position.KEY_BATTERY_LEVEL, battery);
+                    if (type == MSG_STATUS && "R11".equals(model)) {
+                        position.set(Position.KEY_POWER, buf.readUnsignedShort() * 0.01);
+                    } else {
+                        int battery = buf.readUnsignedByte();
+                        if (battery <= 6) {
+                            position.set(Position.KEY_BATTERY_LEVEL, battery * 100 / 6);
+                        } else if (battery <= 100) {
+                            position.set(Position.KEY_BATTERY_LEVEL, battery);
+                        }
                     }
                     position.set(Position.KEY_RSSI, buf.readUnsignedByte());
-                    if (modelLW && type == MSG_STATUS) {
+                    if (type == MSG_STATUS && modelLW) {
                         position.set(Position.KEY_POWER, BitUtil.to(buf.readUnsignedShort(), 12) / 10.0);
                     } else {
-                        short alarmExtension = buf.readUnsignedByte();
-                        if (variant != Variant.VXT01) {
-                            position.addAlarm(decodeAlarm(alarmExtension, modelLW));
+                        short extension = buf.readUnsignedByte();
+                        if (type == MSG_STATUS && "SEEWORLD".equals(model)) {
+                            position.set(Position.KEY_POWER, (double) extension);
+                        } else if (variant != Variant.VXT01) {
+                            position.addAlarm(decodeAlarm(extension, modelLW));
                         }
                     }
                 }
@@ -939,7 +942,7 @@ public class Gt06ProtocolDecoder extends BaseProtocolDecoder {
                     temperature = -BitUtil.to(temperature, 15);
                 }
                 position.set(Position.PREFIX_TEMP + 1, temperature * 0.01);
-                position.set("humidity", buf.readUnsignedShort() * 0.01);
+                position.set(Position.KEY_HUMIDITY, buf.readUnsignedShort() * 0.01);
             }
 
             if (type == MSG_GPS_LBS_STATUS_4 && variant == Variant.SL4X) {
@@ -985,17 +988,21 @@ public class Gt06ProtocolDecoder extends BaseProtocolDecoder {
                 position.set(Position.KEY_ODOMETER, buf.readUnsignedInt());
             }
 
+            if (type == MSG_GPS_LBS_STATUS_3 || type == MSG_FENCE_MULTI) {
+                position.set(Position.KEY_GEOFENCE, buf.readUnsignedByte());
+            }
+
         } else if (type == MSG_ALARM) {
 
+            boolean jc400 = variant == Variant.JC400;
             boolean extendedAlarm = dataLength > 7;
             if (extendedAlarm) {
-                if (variant == Variant.JC400) {
+                if (jc400) {
                     buf.readUnsignedShort(); // marker
                     buf.readUnsignedByte(); // version
                 }
                 decodeGps(
-                        position, buf, false,
-                        variant == Variant.JC400, variant == Variant.JC400, variant == Variant.JC400,
+                        position, buf, false, jc400, jc400, jc400, jc400,
                         deviceSession.get(DeviceSession.KEY_TIMEZONE));
             } else {
                 DateBuilder dateBuilder = new DateBuilder((TimeZone) deviceSession.get(DeviceSession.KEY_TIMEZONE))
@@ -1008,6 +1015,7 @@ public class Gt06ProtocolDecoder extends BaseProtocolDecoder {
             }
             short event = buf.readUnsignedByte();
             position.set(Position.KEY_EVENT, event);
+            position.set("eventData", buf.readUnsignedShort());
             switch (event) {
                 case 0x01 -> position.addAlarm(extendedAlarm ? Position.ALARM_SOS : Position.ALARM_GENERAL);
                 case 0x0E -> position.addAlarm(Position.ALARM_LOW_POWER);
@@ -1021,6 +1029,11 @@ public class Gt06ProtocolDecoder extends BaseProtocolDecoder {
                 case 0x93 -> position.addAlarm(Position.ALARM_ACCIDENT);
             }
 
+            int filesLength = buf.readableBytes() - 6;
+            if (filesLength > 0) {
+                position.set("eventFiles", buf.readCharSequence(filesLength, StandardCharsets.US_ASCII).toString());
+            }
+
         } else {
 
             if (dataLength > 0) {
@@ -1031,18 +1044,6 @@ public class Gt06ProtocolDecoder extends BaseProtocolDecoder {
             }
             return null;
 
-        }
-
-        if (hasLanguage(type)) {
-            if (modelLW && type == MSG_STATUS) {
-                position.set(Position.KEY_POWER, BitUtil.to(buf.readUnsignedShort(), 12) * 0.1);
-            } else {
-                buf.readUnsignedShort(); // language
-            }
-        }
-
-        if (type == MSG_GPS_LBS_STATUS_3 || type == MSG_FENCE_MULTI) {
-            position.set(Position.KEY_GEOFENCE, buf.readUnsignedByte());
         }
 
         sendResponse(channel, false, type, buf.getShort(buf.writerIndex() - 6), null);
@@ -1383,8 +1384,6 @@ public class Gt06ProtocolDecoder extends BaseProtocolDecoder {
                 if (photo != null) {
                     buf.readBytes(photo, buf.readableBytes() - 3 * 2);
                     if (!photo.isWritable()) {
-                        position = new Position(getProtocolName());
-                        position.setDeviceId(deviceSession.getDeviceId());
                         getLastLocation(position, new Date(timestamp));
                         position.set(Position.KEY_IMAGE, writeMediaFile(deviceSession.getUniqueId(), photo, "jpg"));
                         photos.remove(mediaId).release();
@@ -1399,8 +1398,6 @@ public class Gt06ProtocolDecoder extends BaseProtocolDecoder {
 
         } else if (type == MSG_SERIAL) {
 
-            position = new Position(getProtocolName());
-            position.setDeviceId(deviceSession.getDeviceId());
             getLastLocation(position, null);
 
             buf.readUnsignedByte(); // external device type code
@@ -1412,6 +1409,43 @@ public class Gt06ProtocolDecoder extends BaseProtocolDecoder {
             } else {
                 position.set(Position.KEY_RESULT, ByteBufUtil.hexDump(data));
             }
+
+            return position;
+
+        } else if (type == MSG_PERIPHERAL) {
+
+            long timestamp = buf.readUnsignedInt() * 1000;
+            getLastLocation(position, new Date(timestamp));
+
+            while (buf.readableBytes() > 6) {
+                int statusId = buf.readUnsignedShort();
+                switch (statusId) {
+                    case 0x000A -> {
+                        int statusLength = buf.readUnsignedShort();
+                        buf.readUnsignedByte(); // mac address type
+                        position.set("mac", ByteBufUtil.hexDump(buf.readSlice(6)));
+                        int event = buf.readUnsignedByte();
+                        position.set(Position.KEY_EVENT, event);
+                        int eventData = buf.readUnsignedByte();
+                        position.set("eventData", event > 0 ? eventData : null);
+                        position.set("dataType", buf.readUnsignedByte());
+                        position.set("dataDetails", ByteBufUtil.hexDump(buf.readSlice(statusLength - 10)));
+                    }
+                    case 0x000C -> {
+                        buf.readUnsignedByte(); // length
+                        position.set("externalBatteryLevel", buf.readUnsignedByte());
+                        position.set("externalBatteryCharge", buf.readUnsignedByte() > 0 ? true : null);
+                        position.set("externalBatteryCycles", buf.readUnsignedShort());
+                        buf.skipBytes(6);
+                    }
+                    default -> {
+                        int statusLength = buf.readUnsignedByte();
+                        buf.skipBytes(statusLength == 0 ? buf.readUnsignedByte() : statusLength);
+                    }
+                }
+            }
+
+            sendResponse(channel, false, type, buf.getShort(buf.writerIndex() - 6), null);
 
             return position;
 
